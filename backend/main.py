@@ -148,17 +148,18 @@ def render_react(code: str):
     file_path = os.path.join(cwd, "..", "app", "page.tsx")
     with open(file_path, "w", encoding="utf-8") as f:
         f.write(code)
-    # Determine the appropriate command based on the operating system
     npm_cmd = "npm.cmd" if platform.system() == "Windows" else "npm"
 
-    # Start the React application
     try:
         if platform.system() == "Windows":
-            subprocess.run(["taskkill", "/F", "/IM", "node.exe"], check=True)
+            subprocess.run(["taskkill", "/F", "/IM", "node.exe"],
+                           check=True, timeout=10)
         else:
-            subprocess.run(["pkill", "node"], check=True)
+            subprocess.run(["pkill", "node"], check=True, timeout=10)
     except subprocess.CalledProcessError:
         pass
+    except subprocess.TimeoutExpired:
+        return "Failed to stop previous Node.js processes"
 
     output_queue = queue.Queue()
     error_messages = []
@@ -167,15 +168,18 @@ def render_react(code: str):
     error_pattern = re.compile(r'Failed to compile|Error:|ERROR in')
     start_time = time.time()
 
-    def handle_output(stream, prefix):
-        for line in iter(stream.readline, ''):
+    def handle_output(stream, prefix, timeout):
+        while True:
+            line = stream.readline()
+            if not line and stream.closed:
+                break
             output_queue.put(f"{prefix}: {line.strip()}")
-        stream.close()
+            if time.time() - start_time > timeout:
+                break
 
     try:
-        # First, build the Next.js application
         build_process = subprocess.Popen(
-            [npm_cmd, "run", "build"],
+            [npm_cmd, "run", "dev"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -183,22 +187,18 @@ def render_react(code: str):
         )
 
         build_stdout_thread = threading.Thread(
-            target=handle_output, args=(build_process.stdout, "build stdout"))
+            target=handle_output, args=(build_process.stdout, "build stdout", 60))
         build_stderr_thread = threading.Thread(
-            target=handle_output, args=(build_process.stderr, "build stderr"))
+            target=handle_output, args=(build_process.stderr, "build stderr", 60))
 
         build_stdout_thread.start()
         build_stderr_thread.start()
 
-        build_stdout_thread.join()
-        build_stderr_thread.join()
-
-        build_process.wait()
+        build_process.wait(timeout=60)
 
         if build_process.returncode != 0:
             return "Failed to build the Next.js application"
 
-        # Then start the application
         process = subprocess.Popen(
             [npm_cmd, "start"],
             stdout=subprocess.PIPE,
@@ -208,20 +208,17 @@ def render_react(code: str):
         )
 
         stdout_thread = threading.Thread(
-            target=handle_output, args=(process.stdout, "stdout"))
+            target=handle_output, args=(process.stdout, "stdout", 30))
         stderr_thread = threading.Thread(
-            target=handle_output, args=(process.stderr, "stderr"))
+            target=handle_output, args=(process.stderr, "stderr", 30))
 
         stdout_thread.start()
         stderr_thread.start()
 
-        compilation_failed = False
-
         while True:
             try:
-                # Wait for 5 seconds for new output
                 line = output_queue.get(timeout=5)
-                print(line)  # Print the output for debugging
+                print(line)
 
                 if success_pattern.search(line):
                     with open("application.flag", "w") as f:
@@ -229,23 +226,21 @@ def render_react(code: str):
                     return "npm start completed successfully"
 
                 if error_pattern.search(line):
-                    compilation_failed = True
                     error_messages.append(line)
 
-                if compilation_failed and "webpack compiled with" in line:
-                    return "npm start failed with errors:\n" + "\n".join(error_messages)
-
-            except queue.Empty:
-                # Check if we've exceeded the timeout
                 if time.time() - start_time > 30:
+                    process.terminate()
                     return f"npm start process timed out after 30 seconds"
 
-            if not stdout_thread.is_alive() and not stderr_thread.is_alive():
-                # Both output streams have closed
-                break
+            except queue.Empty:
+                if not stdout_thread.is_alive() and not stderr_thread.is_alive():
+                    break
 
     except Exception as e:
         return f"An error occurred: {str(e)}"
+    finally:
+        if 'process' in locals():
+            process.terminate()
 
     if error_messages:
         return "npm start failed with errors:\n" + "\n".join(error_messages)
